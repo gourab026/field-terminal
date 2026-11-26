@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+
+# Files the app writes into its own folder at runtime (on the handheld or in demo mode)
+ports/fieldterminal/config.json
+ports/fieldterminal/cache.json
+ports/fieldterminal/log.txt
+ports/fieldterminal/logs/
+ports/fieldterminal/captures/
+
+# Local output
+out/
+*.pcap

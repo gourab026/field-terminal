@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<gameList>
+  <game>
+    <path>./Field Terminal.sh</path>
+    <name>Field Terminal</name>
+    <desc>A pocket system monitor and network lab. Battery time left and health (learned from a tiny boot logger), CPU cores, temperature and mode, memory and ZRAM, storage and game count, top programs, plus everything for networks: Wi-Fi scanner, device discovery, port scan, live packet capture with .pcap export, ping, traceroute and DNS tests. For networks you own or have permission to test.</desc>
+    <releasedate>20261125T000000</releasedate>
+    <developer>Homebrew</developer>
+    <publisher>Homebrew</publisher>
+    <genre>Utility</genre>
+    <image>./fieldterminal/screenshot.png</image>
+    <thumbnail>./fieldterminal/cover.png</thumbnail>
+  </game>
+</gameList>

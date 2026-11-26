@@ -1,0 +1,8 @@
+# The launcher and the boot service run under bash on the handheld: a Windows checkout
+# must not turn them into CRLF files, or they fail with "bad interpreter".
+* text=auto eol=lf
+*.sh text eol=lf
+ports/fieldterminal/service/fieldterminal_log text eol=lf
+
+*.png binary
+*.ttf binary

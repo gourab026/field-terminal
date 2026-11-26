@@ -1,0 +1,169 @@
+#!/bin/bash
+# Field Terminal battery logger - a Knulli user service (/userdata/system/services/fieldterminal_log).
+#
+# Once a minute it READS the battery, CPU temperature and screen brightness and keeps the line in
+# memory; every 10 lines (and when stopped, e.g. at shutdown) it appends them to
+#   /userdata/system/fieldterminal/battery-YYYYMM.csv
+# It writes nothing else, changes no setting, and keeps the last 6 monthly files (about 2 MB each).
+#
+#   fieldterminal_log start | stop | status
+#
+# Turn it off in Field Terminal (POWER tab) or with:  knulli-services disable fieldterminal_log
+
+ROOT="${FT_SYSROOT:-}"
+DATA="${FT_DATA:-/userdata/system/fieldterminal}"
+RUN="${FT_RUN:-/var/run}"
+INTERVAL="${FT_INTERVAL:-60}"
+FLUSH="${FT_FLUSH:-10}"
+KEEP=6
+PIDFILE="$RUN/fieldterminal_log.pid"
+SELF="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+
+running_pid() {
+    local pid
+    [ -f "$PIDFILE" ] || return 1
+    read -r pid < "$PIDFILE" 2>/dev/null || return 1
+    [ -n "$pid" ] && [ -d "/proc/$pid" ] || return 1
+    grep -q "fieldterminal_log" "/proc/$pid/cmdline" 2>/dev/null || return 1
+    echo "$pid"
+}
+
+find_battery() {
+    local d t best=""
+    local first="" scope
+    for d in "$ROOT"/sys/class/power_supply/*; do
+        [ -r "$d/type" ] || continue
+        read -r t < "$d/type"
+        [ "$t" = "Battery" ] || continue
+        scope=""; [ -r "$d/scope" ] && read -r scope < "$d/scope"
+        [ "$scope" = "Device" ] && continue      # a paired gamepad / mouse battery, not the handheld's
+        [ -z "$first" ] && first="$d"
+        case "${d##*/}" in *[Bb][Aa][Tt]*) [ -z "$best" ] && best="$d" ;; esac
+    done
+    echo "${best:-$first}"
+}
+
+rd() { # rd file -> first line or empty
+    local v=""
+    [ -r "$1" ] && read -r v < "$1" 2>/dev/null
+    echo "$v"
+}
+
+sample() {
+    local now up status uv ua mv="" ma="" pct kpct bpid t ctemp="" b m bright="" d
+    printf -v now '%(%s)T' -1
+    up="$(rd "$ROOT/proc/uptime")"; up="${up%% *}"; up="${up%%.*}"
+    status="$(rd "$BAT/status")"
+    uv="$(rd "$BAT/voltage_now")"
+    ua="$(rd "$BAT/current_now")"; ua="${ua#-}"
+    if [ -n "$uv" ]; then
+        if [ "$uv" -gt 100000 ] 2>/dev/null; then mv=$(( uv / 1000 )); else mv="$uv"; fi
+    fi
+    if [ -n "$ua" ]; then
+        # same rule as the app (sysinfo.current_ma): > 5000 can only be uA; while (dis)charging a
+        # smaller number is mA; a trickle when full follows the voltage's unit
+        if [ "$ua" -gt 5000 ] 2>/dev/null; then ma=$(( ua / 1000 ))
+        elif [ "$status" = "Charging" ] || [ "$status" = "Discharging" ]; then ma="$ua"
+        elif [ "${uv:-0}" -gt 100000 ] 2>/dev/null; then ma=$(( ua / 1000 ))
+        else ma="$ua"; fi
+    fi
+    kpct="$(rd "$BAT/capacity")"
+    pct="$(rd "$ROOT/tmp/battery.percent")"
+    bpid="$(rd "$ROOT/var/run/batteryplus.pid")"
+    if [ -n "$bpid" ] && [ ! -d "$ROOT/proc/$bpid" ]; then pct=""; fi    # Knulli's tracker stopped
+    [ -n "$pct" ] || pct="$kpct"
+    t="$(rd "$ROOT/sys/class/thermal/thermal_zone0/temp")"
+    if [ -n "$t" ] && [ "$t" -gt 200 ] 2>/dev/null; then ctemp="$(( t / 1000 )).$(( t % 1000 / 100 ))"; else ctemp="$t"; fi
+    for d in "$ROOT"/sys/class/backlight/*; do
+        b="$(rd "$d/brightness")"; m="$(rd "$d/max_brightness")"
+        if [ -n "$b" ] && [ "${m:-0}" -gt 0 ] 2>/dev/null; then bright=$(( 100 * b / m )); break; fi
+    done
+    LINE="$now,$up,$status,$mv,$ma,$pct,$kpct,$ctemp,$bright"
+}
+
+flush() {
+    [ -n "$BUF" ] || return 0
+    local f
+    mkdir -p "$DATA" 2>/dev/null || return 0
+    f="$DATA/battery-$(printf '%(%Y%m)T' -1).csv"
+    [ -f "$f" ] || echo "# Field Terminal battery log v1: epoch,uptime_s,status,mV,mA,pct,kernel_pct,cpu_C,brightness_pct" >> "$f"
+    printf '%s' "$BUF" >> "$f"
+    BUF=""
+    NBUF=0
+    rotate
+}
+
+rotate() {
+    local files=( "$DATA"/battery-*.csv ) i n
+    n=${#files[@]}
+    [ -e "${files[0]}" ] || return 0
+    for (( i = 0; i < n - KEEP; i++ )); do rm -f -- "${files[$i]}"; done
+}
+
+LOCK="$RUN/fieldterminal_log.lock"
+
+take_lock() { # only one logger at a time, even if two starts overlap (mkdir is atomic)
+    mkdir "$LOCK" 2>/dev/null && return 0
+    sleep 0.5                                  # the other copy may still be writing its pidfile
+    running_pid >/dev/null && return 1         # a live logger holds it
+    rm -rf "$LOCK"                             # left behind by a killed logger
+    mkdir "$LOCK" 2>/dev/null
+}
+
+loop() {
+    BAT="$(find_battery)"
+    [ -n "$BAT" ] || exit 0          # no battery: nothing to log
+    mkdir -p "$RUN" 2>/dev/null
+    take_lock || exit 0
+    echo $$ > "$PIDFILE"
+    BUF=""
+    NBUF=0
+    SP=""
+    trap '[ -n "$SP" ] && kill "$SP" 2>/dev/null; flush; rm -f "$PIDFILE"; rmdir "$LOCK" 2>/dev/null; exit 0' TERM INT HUP
+    while :; do
+        sample
+        if [ "${LINE%%,*}" -gt 1600000000 ] 2>/dev/null; then   # skip while the clock is not set yet
+            BUF+="$LINE"$'\n'
+            NBUF=$(( NBUF + 1 ))
+        fi
+        [ "$NBUF" -ge "$FLUSH" ] && flush
+        sleep "$INTERVAL" &
+        SP=$!
+        wait "$SP"
+        SP=""
+    done
+}
+
+case "$1" in
+    start)
+        running_pid >/dev/null && exit 0
+        if command -v setsid >/dev/null 2>&1; then
+            setsid bash "$SELF" loop </dev/null >/dev/null 2>&1 &
+        else
+            nohup bash "$SELF" loop </dev/null >/dev/null 2>&1 &
+        fi
+        for _ in 1 2 3 4 5 6 7 8 9 10; do running_pid >/dev/null && break; sleep 0.1; done
+        ;;
+    stop)
+        pid="$(running_pid)" || exit 0
+        kill -TERM "$pid" 2>/dev/null
+        for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+            [ -d "/proc/$pid" ] || break
+            sleep 0.1
+        done
+        ;;
+    restart)
+        bash "$SELF" stop
+        bash "$SELF" start
+        ;;
+    status)
+        if pid="$(running_pid)"; then echo "running $pid"; else echo "stopped"; exit 1; fi
+        ;;
+    loop)
+        loop
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart|status}"
+        ;;
+esac
+exit 0
